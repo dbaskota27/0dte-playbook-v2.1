@@ -100,9 +100,9 @@ maxDayTr  = input.int(2,     "Max entries per day", minval=1, maxval=6, group="R
      tooltip="The second entry is a worse trade: the squeeze already released.")
 coolBars  = input.int(3,     "Cooldown bars after a losing round trip", minval=0, maxval=12, group="Risk Harness")
 volMultIn = input.float(1.15,"Volume x Avg", step=0.05, group="Risk Harness")
-amEnd     = input.int(1100,  "Morning window end (HHMM ET)", group="Risk Harness",
-     tooltip="Bar OPEN time. 1100 means the 10:55 bar (closes 11:00 on 5-min) can still enter; the 11:00 bar cannot.")
-lastEntry = input.int(1100,  "Last Entry (HHMM ET)", group="Risk Harness",
+amEnd     = input.int(1130,  "Morning window end (HHMM ET)", group="Risk Harness",
+     tooltip="Bar OPEN time. 1130 is the window that carried the QQQ morning result. 1100 cuts off the 11:00 and 11:25 bars.")
+lastEntry = input.int(1130,  "Last Entry (HHMM ET)", group="Risk Harness",
      tooltip="Caps every window, including morning. Afternoon cannot fire unless this is above 1300 and the afternoon toggle is on.")
 flatTime  = input.int(1225,  "Flatten (HHMM ET, bar open)", group="Risk Harness",
      tooltip="1225 flattens on the bar that opens 12:25 and, on a 5-min chart, fills at its 12:30 close. 1445 is too late for long 0DTE premium.")
@@ -112,7 +112,7 @@ pmOn      = input.bool(false,"Allow afternoon entries (13:00–last entry)", gro
 orbEndTime= input.int(1130,  "ORB entry deadline (HHMM ET)", group="Risk Harness")
 htfFilter = input.bool(true, "Daily EMA21 filter (longs above / shorts below)", group="Risk Harness")
 mtfOn     = input.bool(true, "45m EMA20 gate", group="Risk Harness",
-     tooltip="Play the 5-min setup only when the 45-minute 20 EMA agrees: longs need price above a rising 45m EMA20, shorts the reverse. Last closed 45m bar only, so it does not repaint.")
+     tooltip="5-min setup is allowed only when price is on the right side of the 45-minute 20 EMA. Longs above it, shorts below. Uses the last closed 45m bar, so it does not repaint.")
 mtfTf     = input.timeframe("45", "Mid timeframe", group="Risk Harness")
 mtfLen    = input.int(20, "Mid EMA length", minval=5, maxval=100, group="Risk Harness")
 
@@ -146,7 +146,7 @@ sqzFired = inSqz[1] and not inSqz and sqzLen[1] >= minSqzBars
 // Prior completed daily EMA. lookahead_off is already that bar; do not also shift [1].
 ema21d = request.security(syminfo.tickerid, "D", ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
 // 45m EMA20 and its prior 45m value, both from the last closed mid-timeframe bar.
-[emaMid, emaMidPrev] = request.security(syminfo.tickerid, mtfTf, [ta.ema(close, mtfLen), ta.ema(close, mtfLen)[1]], barmerge.gaps_off, barmerge.lookahead_off)
+emaMid = request.security(syminfo.tickerid, mtfTf, ta.ema(close, mtfLen), barmerge.gaps_off, barmerge.lookahead_off)
 // Prior day high/low. lookahead_on plus [1] is the non-repainting form.
 pdhV = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
 pdlV = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_on)
@@ -179,8 +179,8 @@ orReady = tNum >= 945 and not na(orH) and not na(orL)
 
 htfLongOK  = not htfFilter or na(ema21d) or close > ema21d
 htfShortOK = not htfFilter or na(ema21d) or close < ema21d
-mtfLongOK  = not mtfOn or na(emaMid) or na(emaMidPrev) or (close > emaMid and emaMid > emaMidPrev)
-mtfShortOK = not mtfOn or na(emaMid) or na(emaMidPrev) or (close < emaMid and emaMid < emaMidPrev)
+mtfLongOK  = not mtfOn or na(emaMid) or close > emaMid
+mtfShortOK = not mtfOn or na(emaMid) or close < emaMid
 
 // ═══════════ TRADE STATE ═══════════
 var string curMode = ""
