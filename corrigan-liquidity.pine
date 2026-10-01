@@ -1,0 +1,308 @@
+//@version=6
+// Corrigan liquidity alerts. Brett's system from the Liquidity and Structure video:
+// trend, a level, then a fail-and-reclaim. Not the first touch.
+// Long: price trades above the level, fails through it, then closes back above.
+// Short: price trades below the level, sweeps above it, then closes back below.
+// Stop is the sweep extreme. Target is 1R (the trim he takes once the move equals the risk).
+// A Jun 30–Sep 30 2026 replay of this mechanical version lost on QQQ, SPY, and NVDA.
+// Use a 5-minute chart. One alert: "Any alert() function call", once per bar close.
+indicator("Corrigan Liquidity", overlay=true, max_labels_count=500)
+
+tz = "America/New_York"
+
+grpT = "Trend"
+emaLen  = input.int(21, "EMA length", minval=2, group=grpT)
+emaTf   = input.timeframe("D", "EMA timeframe", group=grpT, tooltip="He uses the 21 EMA on the daily, the hourly, or the 15-minute. Daily is the default.")
+needEma = input.bool(true, "Require trend agreement", group=grpT)
+needVwap = input.bool(true, "Require VWAP side", group=grpT, tooltip="Longs only above the session VWAP. Shorts only below it.")
+
+grpL = "Levels"
+usePdh = input.bool(true, "Prior day high", group=grpL)
+usePdl = input.bool(true, "Prior day low", group=grpL)
+useOr  = input.bool(true, "15-minute opening range", group=grpL)
+useWk  = input.bool(false, "Prior week high and low", group=grpL)
+
+grpR = "Risk"
+tpR    = input.float(1.0, "Target (R)", minval=0.2, step=0.1, group=grpR)
+useAtr = input.bool(true, "Skip absurd stops", group=grpR, tooltip="Drop a sweep tighter than 0.15 ATR or wider than 1.5 ATR. A one-tick wick is not a stop you can use on 0DTE.")
+atrLen = input.int(10, "ATR length", minval=2, group=grpR)
+
+grpS = "Session (ET)"
+sessOn    = input.bool(true, "Session filter", group=grpS)
+startT    = input.int(945, "Earliest entry", group=grpS)
+lastT     = input.int(1500, "Last entry", group=grpS)
+flatT     = input.int(1545, "Flatten", group=grpS)
+
+emaHTF = request.security(syminfo.tickerid, emaTf, ta.ema(close, emaLen), barmerge.gaps_off, barmerge.lookahead_off)
+pdh = request.security(syminfo.tickerid, "D", high, barmerge.gaps_off, barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low, barmerge.gaps_off, barmerge.lookahead_off)
+wkh = request.security(syminfo.tickerid, "W", high, barmerge.gaps_off, barmerge.lookahead_off)
+wkl = request.security(syminfo.tickerid, "W", low, barmerge.gaps_off, barmerge.lookahead_off)
+vwap = ta.vwap(hlc3)
+atr = ta.atr(atrLen)
+
+h = hour(time, tz)
+m = minute(time, tz)
+tNum = h * 100 + m
+dayKey = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+newDay = ta.change(dayKey) != 0
+inEntry = not sessOn or (tNum >= startT and tNum < lastT and tNum < flatT)
+trendUp = not needEma or na(emaHTF) or close > emaHTF
+trendDn = not needEma or na(emaHTF) or close < emaHTF
+aboveVwap = not needVwap or close > vwap
+belowVwap = not needVwap or close < vwap
+
+type Sweep
+    bool seen
+    bool hot
+    float extreme
+    bool used
+
+f_reset(Sweep s) =>
+    s.seen := false
+    s.hot := false
+    s.extreme := na
+    s.used := false
+
+// Fail back through, then close reclaimed. State updates even when a signal is not allowed.
+f_reclaim(float level, Sweep s, bool wantLong) =>
+    bool ready = false
+    float extreme = na
+    if not na(level)
+        if wantLong
+            if s.seen and low < level
+                s.hot := true
+                s.extreme := na(s.extreme) ? low : math.min(s.extreme, low)
+            if s.hot and close > level and not na(s.extreme)
+                ready := not s.used
+                extreme := s.extreme
+                s.hot := false
+                s.extreme := na
+            if high > level
+                s.seen := true
+        else
+            if s.seen and high > level
+                s.hot := true
+                s.extreme := na(s.extreme) ? high : math.max(s.extreme, high)
+            if s.hot and close < level and not na(s.extreme)
+                ready := not s.used
+                extreme := s.extreme
+                s.hot := false
+                s.extreme := na
+            if low < level
+                s.seen := true
+    [ready, extreme]
+
+var Sweep pdhLong = Sweep.new(false, false, na, false)
+var Sweep pdlLong = Sweep.new(false, false, na, false)
+var Sweep orLong  = Sweep.new(false, false, na, false)
+var Sweep wkLong  = Sweep.new(false, false, na, false)
+var Sweep pdhShort = Sweep.new(false, false, na, false)
+var Sweep pdlShort = Sweep.new(false, false, na, false)
+var Sweep orShort  = Sweep.new(false, false, na, false)
+var Sweep wkShort  = Sweep.new(false, false, na, false)
+
+var float orH = na
+var float orL = na
+var bool orLocked = false
+
+var int dir = 0
+var float ep = na
+var float sl = na
+var float tp = na
+var string why = ""
+
+var bool longNow = false
+var bool shortNow = false
+var bool stopNow = false
+var bool tpNow = false
+var string alertTxt = ""
+
+longNow := false
+shortNow := false
+stopNow := false
+tpNow := false
+alertTxt := ""
+
+if newDay
+    f_reset(pdhLong)
+    f_reset(pdlLong)
+    f_reset(orLong)
+    f_reset(wkLong)
+    f_reset(pdhShort)
+    f_reset(pdlShort)
+    f_reset(orShort)
+    f_reset(wkShort)
+    orH := na
+    orL := na
+    orLocked := false
+
+if tNum >= 930 and tNum < 945
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low : math.min(orL, low)
+else if tNum >= 945 and not orLocked and not na(orL)
+    // The range itself traded on both sides of its own edges.
+    orLong.seen := true
+    orShort.seen := true
+    orLocked := true
+
+[pdhL, pdhLsl] = f_reclaim(usePdh ? pdh : na, pdhLong, true)
+[pdlL, pdlLsl] = f_reclaim(usePdl ? pdl : na, pdlLong, true)
+[orLsig, orLsl] = f_reclaim(useOr and orLocked ? orL : na, orLong, true)
+[wkLsig, wkLsl] = f_reclaim(useWk ? wkl : na, wkLong, true)
+[pdhS, pdhSsl] = f_reclaim(usePdh ? pdh : na, pdhShort, false)
+[pdlS, pdlSsl] = f_reclaim(usePdl ? pdl : na, pdlShort, false)
+[orSsig, orSsl] = f_reclaim(useOr and orLocked ? orH : na, orShort, false)
+[wkSsig, wkSsl] = f_reclaim(useWk ? wkh : na, wkShort, false)
+
+f_ok(float extreme, bool isLong) =>
+    float risk = isLong ? close - extreme : extreme - close
+    bool wide = not useAtr or (not na(atr) and risk >= atr * 0.15 and risk <= atr * 1.5)
+    risk > syminfo.mintick * 2 and wide
+
+f_arm(string name, float extreme, bool isLong) =>
+    string side = isLong ? "BUY " : "SELL "
+    side + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(extreme, format.mintick) + " | TP " + str.tostring(isLong ? close + (close - extreme) * tpR : close - (extreme - close) * tpR, format.mintick) + " | " + name
+
+// Exit the open bracket before considering a new entry. Confirmed bar only.
+bool flatNow = false
+if barstate.isconfirmed and dir != 0 and tNum >= flatT
+    flatNow := true
+    alertTxt := "FLAT " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | time stop | was " + why
+    dir := 0
+else if barstate.isconfirmed and dir == 1
+    hitSl = low <= sl
+    hitTp = high >= tp
+    if hitSl and hitTp
+        hitSl := math.abs(open - sl) <= math.abs(open - tp)
+        hitTp := not hitSl
+    if hitSl
+        stopNow := true
+        alertTxt := "STOP " + syminfo.ticker + " long @ " + str.tostring(sl, format.mintick) + " | " + why
+        dir := 0
+    else if hitTp
+        tpNow := true
+        alertTxt := "TP " + syminfo.ticker + " long @ " + str.tostring(tp, format.mintick) + " | " + why
+        dir := 0
+else if barstate.isconfirmed and dir == -1
+    hitSl = high >= sl
+    hitTp = low <= tp
+    if hitSl and hitTp
+        hitSl := math.abs(open - sl) <= math.abs(open - tp)
+        hitTp := not hitSl
+    if hitSl
+        stopNow := true
+        alertTxt := "STOP " + syminfo.ticker + " short @ " + str.tostring(sl, format.mintick) + " | " + why
+        dir := 0
+    else if hitTp
+        tpNow := true
+        alertTxt := "TP " + syminfo.ticker + " short @ " + str.tostring(tp, format.mintick) + " | " + why
+        dir := 0
+
+bool canEnter = barstate.isconfirmed and dir == 0 and not flatNow and not stopNow and not tpNow and inEntry
+if canEnter and trendUp and aboveVwap and pdhL and f_ok(pdhLsl, true)
+    dir := 1
+    ep := close
+    sl := pdhLsl
+    tp := close + (close - pdhLsl) * tpR
+    why := "PDH reclaim"
+    pdhLong.used := true
+    longNow := true
+    alertTxt := f_arm(why, pdhLsl, true)
+else if canEnter and trendUp and aboveVwap and pdlL and f_ok(pdlLsl, true)
+    dir := 1
+    ep := close
+    sl := pdlLsl
+    tp := close + (close - pdlLsl) * tpR
+    why := "PDL reclaim"
+    pdlLong.used := true
+    longNow := true
+    alertTxt := f_arm(why, pdlLsl, true)
+else if canEnter and trendUp and aboveVwap and orLsig and f_ok(orLsl, true)
+    dir := 1
+    ep := close
+    sl := orLsl
+    tp := close + (close - orLsl) * tpR
+    why := "OR low reclaim"
+    orLong.used := true
+    longNow := true
+    alertTxt := f_arm(why, orLsl, true)
+else if canEnter and trendUp and aboveVwap and wkLsig and f_ok(wkLsl, true)
+    dir := 1
+    ep := close
+    sl := wkLsl
+    tp := close + (close - wkLsl) * tpR
+    why := "Week low reclaim"
+    wkLong.used := true
+    longNow := true
+    alertTxt := f_arm(why, wkLsl, true)
+else if canEnter and trendDn and belowVwap and pdhS and f_ok(pdhSsl, false)
+    dir := -1
+    ep := close
+    sl := pdhSsl
+    tp := close - (pdhSsl - close) * tpR
+    why := "PDH trap"
+    pdhShort.used := true
+    shortNow := true
+    alertTxt := f_arm(why, pdhSsl, false)
+else if canEnter and trendDn and belowVwap and pdlS and f_ok(pdlSsl, false)
+    dir := -1
+    ep := close
+    sl := pdlSsl
+    tp := close - (pdlSsl - close) * tpR
+    why := "PDL trap"
+    pdlShort.used := true
+    shortNow := true
+    alertTxt := f_arm(why, pdlSsl, false)
+else if canEnter and trendDn and belowVwap and orSsig and f_ok(orSsl, false)
+    dir := -1
+    ep := close
+    sl := orSsl
+    tp := close - (orSsl - close) * tpR
+    why := "OR high trap"
+    orShort.used := true
+    shortNow := true
+    alertTxt := f_arm(why, orSsl, false)
+else if canEnter and trendDn and belowVwap and wkSsig and f_ok(wkSsl, false)
+    dir := -1
+    ep := close
+    sl := wkSsl
+    tp := close - (wkSsl - close) * tpR
+    why := "Week high trap"
+    wkShort.used := true
+    shortNow := true
+    alertTxt := f_arm(why, wkSsl, false)
+
+if barstate.isconfirmed and (longNow or shortNow or stopNow or tpNow or flatNow) and alertTxt != ""
+    alert(alertTxt, alert.freq_once_per_bar_close)
+
+plot(pdh, "PDH", color.new(color.red, 30), 1, plot.style_linebr)
+plot(pdl, "PDL", color.new(color.teal, 30), 1, plot.style_linebr)
+plot(orLocked ? orH : na, "OR high", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(orLocked ? orL : na, "OR low", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(emaHTF, "Trend EMA", color.new(color.white, 0), 2)
+plot(vwap, "VWAP", color.new(color.aqua, 0), 1)
+plot(dir != 0 ? ep : na, "Entry", color.new(color.orange, 0), 2, plot.style_linebr)
+plot(dir != 0 ? sl : na, "Stop", color.new(color.red, 0), 2, plot.style_linebr)
+plot(dir != 0 ? tp : na, "Target", color.new(color.lime, 0), 2, plot.style_linebr)
+
+plotshape(longNow, "Buy", shape.triangleup, location.belowbar, color.lime, size=size.small)
+plotshape(shortNow, "Sell", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(stopNow, "Stop hit", shape.xcross, location.abovebar, color.red, size=size.tiny)
+plotshape(tpNow, "Target hit", shape.circle, location.belowbar, color.lime, size=size.tiny)
+
+if longNow or shortNow
+    label.new(bar_index, longNow ? low : high, alertTxt, style=longNow ? label.style_label_up : label.style_label_down, color=longNow ? color.lime : color.red, textcolor=color.black, size=size.small)
+
+var table dash = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 30))
+if barstate.islast
+    table.cell(dash, 0, 0, "Trend", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 0, trendUp and not trendDn ? "UP" : trendDn and not trendUp ? "DOWN" : "FLAT", text_color=trendUp and not trendDn ? color.lime : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 1, "VWAP", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 1, close > vwap ? "ABOVE" : "BELOW", text_color=close > vwap ? color.lime : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 2, "State", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 2, dir == 0 ? "FLAT" : why, text_color=dir == 0 ? color.gray : color.orange, text_size=size.tiny)
+    table.cell(dash, 0, 3, "Stop", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 3, dir == 0 ? "—" : str.tostring(sl, format.mintick), text_color=color.red, text_size=size.tiny)
+    table.cell(dash, 0, 4, "Target", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 4, dir == 0 ? "—" : str.tostring(tp, format.mintick), text_color=color.lime, text_size=size.tiny)
