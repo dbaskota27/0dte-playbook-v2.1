@@ -161,14 +161,15 @@ f_ok(float extreme, bool isLong) =>
     risk > syminfo.mintick * 2 and wide
 
 f_arm(string name, float extreme, bool isLong) =>
-    string side = isLong ? "BUY " : "SELL "
-    side + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(extreme, format.mintick) + " | TP " + str.tostring(isLong ? close + (close - extreme) * tpR : close - (extreme - close) * tpR, format.mintick) + " | " + name
+    string side = isLong ? "BUY" : "SELL"
+    float target = isLong ? close + (close - extreme) * tpR : close - (extreme - close) * tpR
+    side + " " + syminfo.ticker + "\n" + str.tostring(close, format.mintick) + "\nSL " + str.tostring(extreme, format.mintick) + "\nTP " + str.tostring(target, format.mintick) + "\n" + name
 
 // Exit the open bracket before considering a new entry. Confirmed bar only.
 bool flatNow = false
 if barstate.isconfirmed and dir != 0 and tNum >= flatT
     flatNow := true
-    alertTxt := "FLAT " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | time stop | was " + why
+    alertTxt := "FLAT " + syminfo.ticker + "\n" + str.tostring(close, format.mintick) + "\ntime stop\n" + why
     dir := 0
 else if barstate.isconfirmed and dir == 1
     hitSl = low <= sl
@@ -178,11 +179,11 @@ else if barstate.isconfirmed and dir == 1
         hitTp := not hitSl
     if hitSl
         stopNow := true
-        alertTxt := "STOP " + syminfo.ticker + " long @ " + str.tostring(sl, format.mintick) + " | " + why
+        alertTxt := "STOP " + syminfo.ticker + "\n" + str.tostring(sl, format.mintick) + "\n" + why
         dir := 0
     else if hitTp
         tpNow := true
-        alertTxt := "TP " + syminfo.ticker + " long @ " + str.tostring(tp, format.mintick) + " | " + why
+        alertTxt := "TP " + syminfo.ticker + "\n" + str.tostring(tp, format.mintick) + "\n" + why
         dir := 0
 else if barstate.isconfirmed and dir == -1
     hitSl = high >= sl
@@ -192,11 +193,11 @@ else if barstate.isconfirmed and dir == -1
         hitTp := not hitSl
     if hitSl
         stopNow := true
-        alertTxt := "STOP " + syminfo.ticker + " short @ " + str.tostring(sl, format.mintick) + " | " + why
+        alertTxt := "STOP " + syminfo.ticker + "\n" + str.tostring(sl, format.mintick) + "\n" + why
         dir := 0
     else if hitTp
         tpNow := true
-        alertTxt := "TP " + syminfo.ticker + " short @ " + str.tostring(tp, format.mintick) + " | " + why
+        alertTxt := "TP " + syminfo.ticker + "\n" + str.tostring(tp, format.mintick) + "\n" + why
         dir := 0
 
 bool canEnter = barstate.isconfirmed and dir == 0 and not flatNow and not stopNow and not tpNow and inEntry
@@ -291,8 +292,11 @@ plotshape(shortNow, "Sell", shape.triangledown, location.abovebar, color.red, si
 plotshape(stopNow, "Stop hit", shape.xcross, location.abovebar, color.red, size=size.tiny)
 plotshape(tpNow, "Target hit", shape.circle, location.belowbar, color.lime, size=size.tiny)
 
-if longNow or shortNow
-    label.new(bar_index, longNow ? low : high, alertTxt, style=longNow ? label.style_label_up : label.style_label_down, color=longNow ? color.lime : color.red, textcolor=color.black, size=size.small)
+if barstate.isconfirmed and alertTxt != ""
+    float y = longNow or tpNow ? low : shortNow or stopNow ? high : close
+    labelStyle = longNow or tpNow ? label.style_label_up : label.style_label_down
+    labelCol = stopNow or shortNow ? color.red : flatNow ? color.gray : color.lime
+    label.new(bar_index, y, alertTxt, style=labelStyle, color=labelCol, textcolor=color.black, size=size.normal)
 
 var table dash = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 30))
 if barstate.islast
