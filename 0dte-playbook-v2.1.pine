@@ -1,0 +1,485 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// 0DTE PLAYBOOK v2.1 — Morning squeeze long
+//
+// WHAT CHANGED VS v2.0 (do not compare profit factors to the v1.5 table)
+//   Live book is one setup: squeeze fire LONG, and only if the fire bar
+//   closes above session VWAP. Shorts, pullback, ORB, prior-day break and
+//   VWAP-reclaim stay in the file and default OFF.
+//   Entries: 09:45–11:00 ET. No lunch. No afternoon unless you turn it on
+//   and raise Last Entry above 1300.
+//   Exit: hard stop 1 ATR. Sell half at 1R. Only after that partial fills,
+//   stop on the runner goes to breakeven (armed the next bar — not off this
+//   bar's high). Runner dies on a CLOSE back through the structure line
+//   (default VWAP), or at 10 bars, or at the flatten bar (default 12:25 open,
+//   which is the 12:30 close on a 5-minute chart). Whichever first.
+//   v2.0 bugs fixed here:
+//     • Flat-bar reset used to run after a fresh entry and delete its stop,
+//       and the loss cooldown was latched too late to block that entry.
+//     • Breakeven used the current bar's high, so a bar that both tagged 1R
+//       and ran the stop was tested only against breakeven.
+//     • Daily EMA21 filter was lagged an extra session.
+//     • Structure hold flattened the whole trade from bar one, including
+//       squeeze longs that were already under VWAP.
+//     • "Last entry" did not cap anything you thought it capped; morning
+//       end is now its own input and last entry caps every window.
+//     • Day boundary and opening range follow America/New_York, not the
+//       first bars of an extended-hours session.
+//     • Exit alerts identify the half vs the runner. A hard stop before the
+//       scale is two half-fills. Close the contract once.
+//
+// ALERT
+//   Add to a 5-min RTH chart → alert → this strategy → Order fills only.
+//   Message box, paste exactly:
+//     {{strategy.order.comment}} | {{strategy.order.alert_message}} | {{ticker}} @ {{strategy.order.price}}
+//   Do not also arm an alertcondition. There isn't one in this file.
+//
+// HONESTY
+//   process_orders_on_close fills the signal bar's close. You will not get
+//   that print live. Act on the next price or skip. P&L is the underlying.
+//   Theta, IV crush, spread and a −50% premium stop are NOT in the tester.
+//   The alert tells you to honor −50% premium yourself.
+//   Nothing here is financial advice. Re-test SPY, QQQ and NVDA in-sample,
+//   then a later window, before sizing real premium.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("0DTE Playbook v2.1", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     pyramiding=0,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     slippage=1,
+     process_orders_on_close=true,
+     use_bar_magnifier=true,
+     calc_on_every_tick=false,
+     max_labels_count=500)
+
+// ═══════════ INPUTS ═══════════
+btStart = input.time(timestamp("1 Jan 2020 00:00 +0000"), "Backtest Start", group="Backtest Window")
+btEnd   = input.time(timestamp("1 Jan 2035 00:00 +0000"), "Backtest End",   group="Backtest Window")
+
+sqzLongOn  = input.bool(true,  "Squeeze Fire — LONG",  group="1 · Squeeze Fire",
+     tooltip="BB(20,2) inside KC(20,1.5) for Min Squeeze Bars, then release up with volume, a bullish close, and a close above VWAP. The only cell that printed a profit factor above 1 in the v1 audit, and only with a VWAP hold on the runner.")
+sqzShortOn = input.bool(false, "Squeeze Fire — SHORT", group="1 · Squeeze Fire",
+     tooltip="Off. Short squeeze was under 1.0 on fixed-R. In-sample improvement under structure hold was not confirmed out of sample.")
+minSqzBars = input.int(6, "Min Squeeze Bars", minval=2, maxval=30, group="1 · Squeeze Fire")
+sqzNeedVol = input.bool(true, "Squeeze requires volume", group="1 · Squeeze Fire")
+sqzNeedVwap = input.bool(true, "Squeeze must close on the VWAP side", group="1 · Squeeze Fire",
+     tooltip="Longs require close > session VWAP. A fire that is already through the hold line is not the 1.89 trade.")
+
+pbLongOn  = input.bool(false, "Trend Pullback — LONG  (research)", group="2 · Trend Pullback",
+     tooltip="Off. Breakeven on the v1 rules, and VWAP-hold on pullbacks lost on the SPY window. If you retest, leave the runner on Fixed R.")
+pbShortOn = input.bool(false, "Trend Pullback — SHORT (research)", group="2 · Trend Pullback")
+pbNeedCloseDir = input.bool(true, "Pullback requires directional close", group="2 · Trend Pullback")
+
+vwapLongOn  = input.bool(false, "VWAP Reclaim — LONG  (research)",  group="9 · Research (off)")
+vwapShortOn = input.bool(false, "VWAP Reclaim — SHORT (research)", group="9 · Research (off)")
+orbLongOn   = input.bool(false, "ORB — LONG  (research)",          group="9 · Research (off)")
+orbShortOn  = input.bool(false, "ORB — SHORT (research)",          group="9 · Research (off)")
+pdLongOn    = input.bool(false, "PDH Break — LONG  (research)",    group="9 · Research (off)")
+pdShortOn   = input.bool(false, "PDL Break — SHORT (research)",    group="9 · Research (off)")
+
+sqzExit = input.string("Structure Hold", "Squeeze — Runner Exit", options=["Fixed R", "Structure Hold"], group="Exit Logic",
+     tooltip="Structure Hold is the measured squeeze exit. Fixed R was the worse print (about 1.36 vs 1.89) and is here only as a comparison.")
+pbExit  = input.string("Fixed R", "Pullback — Runner Exit", options=["Fixed R", "Structure Hold"], group="Exit Logic",
+     tooltip="Leave this on Fixed R. Structure-holding pullbacks is what dragged the SPY test.")
+othExit = input.string("Fixed R", "Research setups — Runner Exit", options=["Fixed R", "Structure Hold"], group="Exit Logic")
+structRule = input.string("VWAP Hold", "Structure Rule", options=["VWAP Hold", "EMA21 Hold", "Swing Break (3-bar)"], group="Exit Logic",
+     tooltip="VWAP. EMA21 lost to VWAP when both were used as the same hold line. A 3-bar swing on 5-min is fifteen minutes and chops the runner.")
+
+atrLen    = input.int(10,    "ATR Length", group="Risk Harness")
+slATR     = input.float(1.0, "Stop (x ATR)", step=0.1, group="Risk Harness",
+     tooltip="Underlying stop. A full ATR against the fire means it is no longer the runner. Also honor −50% of the option premium; the tester cannot see that.")
+scaleR    = input.float(1.0, "Scale-out at (R)", step=0.1, group="Risk Harness")
+rrRatio   = input.float(1.5, "Runner target (R) — Fixed R only", step=0.1, group="Risk Harness",
+     tooltip="Used only when that setup's runner is Fixed R. Squeeze default does not use this.")
+beAtR     = input.float(1.0, "Move runner to BE after (R)", step=0.1, group="Risk Harness",
+     tooltip="Applied only after the scale partial has actually filled, and only from the prior bar's extreme. 0 = move to BE as soon as the scale fills.")
+maxHold   = input.int(10,    "Theta clock (bars)", minval=2, group="Risk Harness",
+     tooltip="10 bars on a 5-min chart is about 50 minutes from the first bar the position is visible.")
+maxDayTr  = input.int(2,     "Max entries per day", minval=1, maxval=6, group="Risk Harness",
+     tooltip="The second entry is a worse trade: the squeeze already released.")
+coolBars  = input.int(3,     "Cooldown bars after a losing round trip", minval=0, maxval=12, group="Risk Harness")
+volMultIn = input.float(1.15,"Volume x Avg", step=0.05, group="Risk Harness")
+amEnd     = input.int(1100,  "Morning window end (HHMM ET)", group="Risk Harness",
+     tooltip="Bar OPEN time. 1100 means the 10:55 bar (closes 11:00 on 5-min) can still enter; the 11:00 bar cannot.")
+lastEntry = input.int(1100,  "Last Entry (HHMM ET)", group="Risk Harness",
+     tooltip="Caps every window, including morning. Afternoon cannot fire unless this is above 1300 and the afternoon toggle is on.")
+flatTime  = input.int(1225,  "Flatten (HHMM ET, bar open)", group="Risk Harness",
+     tooltip="1225 flattens on the bar that opens 12:25 and, on a 5-min chart, fills at its 12:30 close. 1445 is too late for long 0DTE premium.")
+tradeLunch= input.bool(false,"Allow 11:30–13:00 entries", group="Risk Harness")
+pmOn      = input.bool(false,"Allow afternoon entries (13:00–last entry)", group="Risk Harness",
+     tooltip="Off. Same family of morning signals lost money after 11:30 in the QQQ time split.")
+orbEndTime= input.int(1130,  "ORB entry deadline (HHMM ET)", group="Risk Harness")
+htfFilter = input.bool(true, "HTF filter (longs above prior daily EMA21 / shorts below)", group="Risk Harness")
+
+alertStyle = input.string("Text (push)", "Alert Format", options=["Text (push)", "JSON (webhook)"], group="0DTE Alerts")
+strikeInc  = input.float(1.0, "Strike Increment ($)", step=0.5, group="0DTE Alerts")
+otmSteps   = input.int(0, "Strikes OTM (0 = ATM)", minval=0, maxval=5, group="0DTE Alerts",
+     tooltip="0. Farther OTM premium is the part that decays fastest.")
+alertExits = input.bool(true, "Include Exit Payloads", group="0DTE Alerts")
+showDash   = input.bool(true, "Show Dashboard", group="Display")
+
+// ═══════════ SHARED CALCS ═══════════
+atrVal  = ta.atr(atrLen)
+vwapVal = ta.vwap(hlc3)
+ema9    = ta.ema(close, 9)
+ema21   = ta.ema(close, 21)
+ema21Rising  = ema21 > ema21[1]
+ema21Falling = ema21 < ema21[1]
+volAvg  = ta.sma(volume, 20)[1]
+volOK   = not na(volAvg) and volume > volAvg * volMultIn
+
+bbB = ta.sma(close, 20)
+bbS = ta.stdev(close, 20)
+kcB = ta.ema(close, 20)
+kcR = 1.5 * ta.atr(20)
+inSqz = (bbB + 2.0 * bbS) < (kcB + kcR) and (bbB - 2.0 * bbS) > (kcB - kcR)
+var int sqzLen = 0
+sqzLen := inSqz ? sqzLen + 1 : 0
+sqzMom   = ta.linreg(close - math.avg(math.avg(ta.highest(high, 20), ta.lowest(low, 20)), bbB), 20, 0)
+sqzFired = inSqz[1] and not inSqz and sqzLen[1] >= minSqzBars
+
+// Prior completed daily EMA. lookahead_off is already that bar; do not also shift [1].
+ema21d = request.security(syminfo.tickerid, "D", ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
+// Prior day high/low. lookahead_on plus [1] is the non-repainting form.
+pdhV = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+pdlV = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_on)
+
+hrET = hour(time, "America/New_York")
+mnET = minute(time, "America/New_York")
+tNum = hrET * 100 + mnET
+// Calendar day in New York, not the chart's extended-hours session boundary.
+dayKey = year(time, "America/New_York") * 10000 + month(time, "America/New_York") * 100 + dayofmonth(time, "America/New_York")
+newDay = ta.change(dayKey) != 0
+inWin  = time >= btStart and time <= btEnd
+
+inMorning   = tNum >= 945 and tNum < amEnd and tNum < lastEntry
+inAfternoon = pmOn and tNum >= 1300 and tNum < lastEntry
+inLunch     = tradeLunch and tNum >= 1130 and tNum < 1300 and tNum < lastEntry
+inSession   = inMorning or inAfternoon or inLunch
+eod         = tNum >= flatTime
+
+// Opening range is 09:30–09:45 ET, whatever session the chart is set to.
+var float orH = na
+var float orL = na
+if newDay
+    orH := na
+    orL := na
+inOrbBuild = tNum >= 930 and tNum < 945
+if inOrbBuild
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low : math.min(orL, low)
+orReady = tNum >= 945 and not na(orH) and not na(orL)
+
+htfLongOK  = not htfFilter or na(ema21d) or close > ema21d
+htfShortOK = not htfFilter or na(ema21d) or close < ema21d
+
+// ═══════════ TRADE STATE ═══════════
+var string curMode = ""
+var string curExit = "Fixed R"
+var float  entryPx = na
+var float  entryRisk = na
+var float  eSL = na
+var float  eTP1 = na
+var float  eTP2 = na
+var bool   beArmed = false
+var int    tradesAtEntry = -1
+var int    dayTrades = 0
+var int    lastLossBar = -9999
+var int    barsIn = 0
+var int    rtN = 0
+var int    rtWins = 0
+var float  rtGrossWin = 0.0
+var float  rtGrossLoss = 0.0
+
+// ═══════════ ALERT HELPERS ═══════════
+f_exitFor(string _mode) =>
+    _mode == "SQZ_FIRE" ? sqzExit : _mode == "PULLBACK" ? pbExit : othExit
+
+f_strike(bool _long) =>
+    float atm = math.round(close / strikeInc) * strikeInc
+    _long ? atm + otmSteps * strikeInc : atm - otmSteps * strikeInc
+
+f_contract(bool _long) =>
+    syminfo.ticker + " 0DTE " + str.tostring(f_strike(_long), "#.##") + (_long ? "C" : "P")
+
+f_holdTxt() =>
+    curExit == "Structure Hold" ?
+         (structRule == "VWAP Hold" ? "runner closes back through VWAP" : structRule == "EMA21 Hold" ? "runner closes back through EMA21" : "runner closes through 3-bar swing") :
+         "runner limit " + str.tostring(rrRatio, "#.#") + "R"
+
+f_barCloseET() =>
+    str.format_time(time_close, "HH:mm", "America/New_York")
+
+f_entryMsg(bool _long, string _mode, float _sl) =>
+    string ct = f_contract(_long)
+    string px = str.tostring(close, format.mintick)
+    string slS = str.tostring(_sl, format.mintick)
+    string rule = "scale 50% @ " + str.tostring(scaleR, "#.#") + "R, BE runner after fill, " + f_holdTxt() + ", clock " + str.tostring(maxHold) + " bars, premium stop -50%"
+    alertStyle == "JSON (webhook)" ?
+         '{"event":"entry","side":"' + (_long ? "long" : "short") + '","setup":"' + _mode +
+         '","ticker":"' + syminfo.ticker + '","signal_close":' + px +
+         ',"contract":"' + ct + '","stop_underlying":' + slS +
+         ',"premium_stop_pct":-50,"rule":"' + rule + '","bar_close_et":"' + f_barCloseET() + '"}' :
+         (_long ? "BUY " : "BUY ") + ct + "  [" + _mode + "]\n" +
+         "signal close " + px + " · underlying stop " + slS + " · also exit the option at -50% premium\n" +
+         rule + "\n" + f_barCloseET() + " ET close. You will not be filled at this price — next print or skip."
+
+f_exitCtx(string portion) =>
+    alertStyle == "JSON (webhook)" ?
+         '{"event":"exit","portion":"' + portion + '","setup":"' + curMode + '","ticker":"' + syminfo.ticker + '"}' :
+         portion + " [" + curMode + "] — comment is SCALE, SL, TP, STRUCT, THETA or FLAT"
+
+// ═══════════ SIGNALS ═══════════
+sigSqzL = sqzFired and sqzMom > 0 and close > open and (not sqzNeedVol or volOK) and (not sqzNeedVwap or close > vwapVal)
+sigSqzS = sqzFired and sqzMom < 0 and close < open and (not sqzNeedVol or volOK) and (not sqzNeedVwap or close < vwapVal)
+
+sigPbL = close > vwapVal and ema9 > ema21 and ema21Rising and low <= ema21 and low >= vwapVal and close > ema9 and (not pbNeedCloseDir or close > open) and tNum >= 1000
+sigPbS = close < vwapVal and ema9 < ema21 and ema21Falling and high >= ema21 and high <= vwapVal and close < ema9 and (not pbNeedCloseDir or close < open) and tNum >= 1000
+
+below3 = close[1] < vwapVal[1] and close[2] < vwapVal[2] and close[3] < vwapVal[3]
+above3 = close[1] > vwapVal[1] and close[2] > vwapVal[2] and close[3] > vwapVal[3]
+sigVwL = close > vwapVal and below3
+sigVwS = close < vwapVal and above3
+
+sigOrbL = orReady and close > orH and close[1] <= orH and volOK and tNum <= orbEndTime
+sigOrbS = orReady and close < orL and close[1] >= orL and volOK and tNum <= orbEndTime
+
+sigPdL = not na(pdhV) and close > pdhV and close[1] <= pdhV and volOK
+sigPdS = not na(pdlV) and close < pdlV and close[1] >= pdlV and volOK
+
+longSig  = (sqzLongOn and sigSqzL)  ? "SQZ_FIRE" :
+           (pbLongOn and sigPbL)    ? "PULLBACK" :
+           (vwapLongOn and sigVwL)  ? "VWAP_RCL" :
+           (orbLongOn and sigOrbL)  ? "ORB"      :
+           (pdLongOn and sigPdL)    ? "PD_BREAK" : ""
+shortSig = (sqzShortOn and sigSqzS) ? "SQZ_FIRE" :
+           (pbShortOn and sigPbS)   ? "PULLBACK" :
+           (vwapShortOn and sigVwS) ? "VWAP_RCL" :
+           (orbShortOn and sigOrbS) ? "ORB"      :
+           (pdShortOn and sigPdS)   ? "PD_BREAK" : ""
+
+// ═══════════ FLAT TRANSITION FIRST (before any new entry) ═══════════
+justFlat = strategy.position_size == 0 and strategy.position_size[1] != 0
+if newDay
+    dayTrades := 0
+
+if justFlat
+    float roundPnL = 0.0
+    int nClose = strategy.closedtrades
+    if tradesAtEntry >= 0 and nClose > tradesAtEntry
+        if nClose - 1 >= tradesAtEntry
+            roundPnL += strategy.closedtrades.profit(nClose - 1)
+        if nClose - 2 >= tradesAtEntry
+            roundPnL += strategy.closedtrades.profit(nClose - 2)
+        if nClose - 3 >= tradesAtEntry
+            roundPnL += strategy.closedtrades.profit(nClose - 3)
+        if roundPnL > 0
+            rtWins += 1
+            rtGrossWin += roundPnL
+        else if roundPnL < 0
+            rtGrossLoss += math.abs(roundPnL)
+            lastLossBar := bar_index
+        rtN += 1
+    entryPx := na
+    entryRisk := na
+    eSL := na
+    eTP1 := na
+    eTP2 := na
+    curMode := ""
+    curExit := "Fixed R"
+    beArmed := false
+    tradesAtEntry := -1
+
+barsIn := strategy.position_size != 0 ? barsIn + 1 : 0
+coolOK = (bar_index - lastLossBar) >= coolBars
+flat = strategy.position_size == 0
+
+goLong  = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfLongOK  and longSig  != ""
+goShort = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfShortOK and shortSig != "" and longSig == ""
+
+// ═══════════ ENTRIES ═══════════
+if goLong
+    curMode := longSig
+    curExit := f_exitFor(longSig)
+    entryPx := close
+    entryRisk := atrVal * slATR
+    eSL := close - entryRisk
+    eTP1 := close + entryRisk * scaleR
+    eTP2 := curExit == "Fixed R" ? close + entryRisk * rrRatio : na
+    beArmed := false
+    tradesAtEntry := strategy.closedtrades
+    dayTrades += 1
+    strategy.entry("LONG", strategy.long, comment=longSig, alert_message=f_entryMsg(true, longSig, eSL))
+
+if goShort
+    curMode := shortSig
+    curExit := f_exitFor(shortSig)
+    entryPx := close
+    entryRisk := atrVal * slATR
+    eSL := close + entryRisk
+    eTP1 := close - entryRisk * scaleR
+    eTP2 := curExit == "Fixed R" ? close - entryRisk * rrRatio : na
+    beArmed := false
+    tradesAtEntry := strategy.closedtrades
+    dayTrades += 1
+    strategy.entry("SHORT", strategy.short, comment=shortSig, alert_message=f_entryMsg(false, shortSig, eSL))
+
+// Scale = a partial that closed better than entry while size is still on.
+// A half that stopped (worse than entry) must not be treated as the scale.
+bool partialWin = false
+if strategy.position_size != 0 and tradesAtEntry >= 0 and strategy.closedtrades > tradesAtEntry and not na(entryPx)
+    float xPx = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    partialWin := strategy.position_size > 0 ? xPx > entryPx : xPx < entryPx
+
+beLevelHit = beAtR <= 0 or (not na(entryPx) and not na(entryRisk) and (strategy.position_size > 0 ? high[1] >= entryPx + entryRisk * beAtR : strategy.position_size < 0 ? low[1] <= entryPx - entryRisk * beAtR : false))
+if partialWin and not beArmed and beLevelHit and not na(eSL)
+    eSL := strategy.position_size > 0 ? math.max(eSL, entryPx + syminfo.mintick) : math.min(eSL, entryPx - syminfo.mintick)
+    beArmed := true
+
+// ═══════════ EXITS ═══════════
+structBreakL = structRule == "VWAP Hold" ? close < vwapVal : structRule == "EMA21 Hold" ? close < ema21 : close < ta.lowest(low, 3)[1]
+structBreakS = structRule == "VWAP Hold" ? close > vwapVal : structRule == "EMA21 Hold" ? close > ema21 : close > ta.highest(high, 3)[1]
+
+longStopHit  = strategy.position_size > 0 and not na(eSL) and low <= eSL
+shortStopHit = strategy.position_size < 0 and not na(eSL) and high >= eSL
+stopHit = longStopHit or shortStopHit
+
+// Structure only manages the runner, and only if the hard stop was not traded.
+structFlatL = curExit == "Structure Hold" and partialWin and strategy.position_size > 0 and structBreakL and not longStopHit
+structFlatS = curExit == "Structure Hold" and partialWin and strategy.position_size < 0 and structBreakS and not shortStopHit
+
+thetaFlat = strategy.position_size != 0 and barsIn >= maxHold
+dayFlat   = strategy.position_size != 0 and (eod or newDay)
+forceFlat = (thetaFlat or dayFlat) and not stopHit
+
+manageLong  = strategy.position_size > 0 and not na(eSL) and not na(eTP1) and not structFlatL and not forceFlat
+manageShort = strategy.position_size < 0 and not na(eSL) and not na(eTP1) and not structFlatS and not forceFlat
+
+if manageLong and not partialWin
+    strategy.exit("XL1", "LONG", qty_percent=50, stop=eSL, limit=eTP1,
+         comment_loss="SL", comment_profit="SCALE",
+         alert_message=alertExits ? f_exitCtx("HALF") : "")
+    if curExit == "Fixed R" and not na(eTP2)
+        strategy.exit("XL2", "LONG", qty_percent=50, stop=eSL, limit=eTP2,
+             comment_loss="SL", comment_profit="TP",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+    else
+        strategy.exit("XL2", "LONG", qty_percent=50, stop=eSL,
+             comment_loss="SL",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+
+if manageLong and partialWin
+    strategy.cancel("XL1")
+    if curExit == "Fixed R" and not na(eTP2)
+        strategy.exit("XL2", "LONG", qty_percent=100, stop=eSL, limit=eTP2,
+             comment_loss="SL", comment_profit="TP",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+    else
+        strategy.exit("XL2", "LONG", qty_percent=100, stop=eSL,
+             comment_loss="SL",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+
+if manageShort and not partialWin
+    strategy.exit("XS1", "SHORT", qty_percent=50, stop=eSL, limit=eTP1,
+         comment_loss="SL", comment_profit="SCALE",
+         alert_message=alertExits ? f_exitCtx("HALF") : "")
+    if curExit == "Fixed R" and not na(eTP2)
+        strategy.exit("XS2", "SHORT", qty_percent=50, stop=eSL, limit=eTP2,
+             comment_loss="SL", comment_profit="TP",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+    else
+        strategy.exit("XS2", "SHORT", qty_percent=50, stop=eSL,
+             comment_loss="SL",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+
+if manageShort and partialWin
+    strategy.cancel("XS1")
+    if curExit == "Fixed R" and not na(eTP2)
+        strategy.exit("XS2", "SHORT", qty_percent=100, stop=eSL, limit=eTP2,
+             comment_loss="SL", comment_profit="TP",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+    else
+        strategy.exit("XS2", "SHORT", qty_percent=100, stop=eSL,
+             comment_loss="SL",
+             alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+
+if structFlatL or structFlatS or forceFlat
+    strategy.cancel("XL1")
+    strategy.cancel("XL2")
+    strategy.cancel("XS1")
+    strategy.cancel("XS2")
+
+if structFlatL and not forceFlat
+    strategy.close("LONG", comment="STRUCT", alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+if structFlatS and not forceFlat
+    strategy.close("SHORT", comment="STRUCT", alert_message=alertExits ? f_exitCtx("RUNNER") : "")
+
+if forceFlat
+    string why = newDay ? "FLAT" : (thetaFlat ? "THETA" : "FLAT")
+    strategy.close_all(comment=why, alert_message=alertExits ? f_exitCtx(why == "THETA" ? "CLOCK" : "FLAT") : "")
+
+// ═══════════ PLOTS ═══════════
+plot(vwapVal, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
+plot(ema9,  "EMA9",  color=color.new(color.aqua, 40))
+plot(ema21, "EMA21", color=color.new(color.orange, 40))
+plot(orReady and tNum <= orbEndTime ? orH : na, "OR High", color=color.new(color.blue, 40), style=plot.style_linebr)
+plot(orReady and tNum <= orbEndTime ? orL : na, "OR Low",  color=color.new(color.blue, 40), style=plot.style_linebr)
+plot(pdhV, "PDH", color=color.new(color.gray, 60), style=plot.style_linebr)
+plot(pdlV, "PDL", color=color.new(color.gray, 60), style=plot.style_linebr)
+plotchar(inSqz, "Squeeze", "•", location.bottom, color=color.red, size=size.tiny)
+plot(strategy.position_size != 0 ? eSL : na, "SL", color=color.new(color.red, 20), style=plot.style_linebr)
+plot(strategy.position_size != 0 and not na(eTP1) ? eTP1 : na, "Scale", color=color.new(color.lime, 20), style=plot.style_linebr)
+plot(strategy.position_size != 0 and not na(eTP2) ? eTP2 : na, "Runner TP", color=color.new(color.green, 40), style=plot.style_linebr)
+
+float swingLine = strategy.position_size > 0 ? ta.lowest(low, 3)[1] : ta.highest(high, 3)[1]
+float structLine = structRule == "VWAP Hold" ? vwapVal : structRule == "EMA21 Hold" ? ema21 : swingLine
+plot(curExit == "Structure Hold" and strategy.position_size != 0 ? structLine : na, "Structure Line",
+     color=color.new(color.fuchsia, 20), linewidth=2, style=plot.style_linebr)
+
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    label.new(bar_index, low - atrVal * 0.5, text="▲ " + curMode, color=color.new(color.green, 15),
+         textcolor=color.white, style=label.style_label_up, size=size.small)
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    label.new(bar_index, high + atrVal * 0.5, text="▼ " + curMode, color=color.new(color.red, 15),
+         textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ═══════════ DASHBOARD ═══════════
+var table dash = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 70),
+     border_width=1, border_color=color.gray)
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "0DTE v2.1", text_color=color.white, text_size=size.small,
+         bgcolor=color.new(color.navy, 50))
+    string activeModes = (sqzLongOn or sqzShortOn ? "SQZ " : "") + (pbLongOn or pbShortOn ? "PB " : "") +
+         (vwapLongOn or vwapShortOn ? "VWAP " : "") + (orbLongOn or orbShortOn ? "ORB " : "") +
+         (pdLongOn or pdShortOn ? "PD" : "")
+    table.cell(dash, 1, 0, activeModes, text_color=color.orange, text_size=size.tiny,
+         bgcolor=color.new(color.navy, 50))
+    string posTxt = strategy.position_size > 0 ? "LONG · " + curMode : strategy.position_size < 0 ? "SHORT · " + curMode : "FLAT"
+    color posCol = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 1, "Position", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 1, posTxt, text_color=posCol, text_size=size.tiny)
+    table.cell(dash, 0, 2, "Hold / Day", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 2, strategy.position_size != 0 ?
+         str.tostring(barsIn) + "/" + str.tostring(maxHold) + " · " + str.tostring(dayTrades) + "/" + str.tostring(maxDayTr) :
+         "— · " + str.tostring(dayTrades) + "/" + str.tostring(maxDayTr),
+         text_color=color.white, text_size=size.tiny)
+    int totTr = rtN
+    float wrPct = totTr > 0 ? rtWins / totTr * 100 : 0.0
+    float pfVal = rtGrossLoss > 0 ? rtGrossWin / rtGrossLoss : rtGrossWin > 0 ? 99.0 : 0.0
+    string perf = totTr == 0 ? "—" : str.tostring(totTr) + " rt  WR " + str.tostring(wrPct, "#.0") + "%  PF " + str.tostring(pfVal, "#.00")
+    color perfCol = strategy.netprofit > 0 and pfVal >= 1.2 ? color.lime : strategy.netprofit > 0 ? color.yellow : color.red
+    table.cell(dash, 0, 3, "Underlying", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 3, perf, text_color=perfCol, text_size=size.tiny)
+    table.cell(dash, 0, 4, "Net", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 4, "$" + str.tostring(strategy.netprofit, "#.00"),
+         text_color=strategy.netprofit >= 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(dash, 0, 5, "Scale / BE", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 5, (partialWin ? "SCALED  " : "50%@" + str.tostring(scaleR, "#.#") + "R  ") + (beArmed ? "BE on" : "BE wait"),
+         text_color=beArmed ? color.lime : color.silver, text_size=size.tiny)
+    table.cell(dash, 0, 6, "Session", text_color=color.silver, text_size=size.tiny)
+    string sessTxt = eod ? "FLAT WINDOW" : inMorning ? "PRIME AM" : inAfternoon ? "PM (research)" : inLunch ? "LUNCH" : "NO ENTRY"
+    table.cell(dash, 1, 6, sessTxt, text_color=eod ? color.red : inSession ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 7, "Runner", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 7, sqzExit == "Structure Hold" ? structRule : "Fixed " + str.tostring(rrRatio, "#.#") + "R",
+         text_color=color.orange, text_size=size.tiny)
