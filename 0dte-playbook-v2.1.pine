@@ -110,7 +110,11 @@ tradeLunch= input.bool(false,"Allow 11:30–13:00 entries", group="Risk Harness"
 pmOn      = input.bool(false,"Allow afternoon entries (13:00–last entry)", group="Risk Harness",
      tooltip="Off. Same family of morning signals lost money after 11:30 in the QQQ time split.")
 orbEndTime= input.int(1130,  "ORB entry deadline (HHMM ET)", group="Risk Harness")
-htfFilter = input.bool(true, "HTF filter (longs above prior daily EMA21 / shorts below)", group="Risk Harness")
+htfFilter = input.bool(true, "Daily EMA21 filter (longs above / shorts below)", group="Risk Harness")
+mtfOn     = input.bool(true, "45m EMA20 gate", group="Risk Harness",
+     tooltip="Play the 5-min setup only when the 45-minute 20 EMA agrees: longs need price above a rising 45m EMA20, shorts the reverse. Last closed 45m bar only, so it does not repaint.")
+mtfTf     = input.timeframe("45", "Mid timeframe", group="Risk Harness")
+mtfLen    = input.int(20, "Mid EMA length", minval=5, maxval=100, group="Risk Harness")
 
 alertStyle = input.string("Text (push)", "Alert Format", options=["Text (push)", "JSON (webhook)"], group="0DTE Alerts")
 strikeInc  = input.float(1.0, "Strike Increment ($)", step=0.5, group="0DTE Alerts")
@@ -141,6 +145,8 @@ sqzFired = inSqz[1] and not inSqz and sqzLen[1] >= minSqzBars
 
 // Prior completed daily EMA. lookahead_off is already that bar; do not also shift [1].
 ema21d = request.security(syminfo.tickerid, "D", ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
+// 45m EMA20 and its prior 45m value, both from the last closed mid-timeframe bar.
+[emaMid, emaMidPrev] = request.security(syminfo.tickerid, mtfTf, [ta.ema(close, mtfLen), ta.ema(close, mtfLen)[1]], barmerge.gaps_off, barmerge.lookahead_off)
 // Prior day high/low. lookahead_on plus [1] is the non-repainting form.
 pdhV = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
 pdlV = request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_off, barmerge.lookahead_on)
@@ -173,6 +179,8 @@ orReady = tNum >= 945 and not na(orH) and not na(orL)
 
 htfLongOK  = not htfFilter or na(ema21d) or close > ema21d
 htfShortOK = not htfFilter or na(ema21d) or close < ema21d
+mtfLongOK  = not mtfOn or na(emaMid) or na(emaMidPrev) or (close > emaMid and emaMid > emaMidPrev)
+mtfShortOK = not mtfOn or na(emaMid) or na(emaMidPrev) or (close < emaMid and emaMid < emaMidPrev)
 
 // ═══════════ TRADE STATE ═══════════
 var string curMode = ""
@@ -295,8 +303,8 @@ barsIn := strategy.position_size != 0 ? barsIn + 1 : 0
 coolOK = (bar_index - lastLossBar) >= coolBars
 flat = strategy.position_size == 0
 
-goLong  = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfLongOK  and longSig  != ""
-goShort = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfShortOK and shortSig != "" and longSig == ""
+goLong  = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfLongOK and mtfLongOK and longSig  != ""
+goShort = flat and inWin and inSession and not eod and not na(atrVal) and dayTrades < maxDayTr and coolOK and htfShortOK and mtfShortOK and shortSig != "" and longSig == ""
 
 // ═══════════ ENTRIES ═══════════
 if goLong
@@ -423,6 +431,7 @@ if forceFlat
 plot(vwapVal, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
 plot(ema9,  "EMA9",  color=color.new(color.aqua, 40))
 plot(ema21, "EMA21", color=color.new(color.orange, 40))
+plot(emaMid, "45m EMA20", color=color.new(color.white, 0), linewidth=2)
 plot(orReady and tNum <= orbEndTime ? orH : na, "OR High", color=color.new(color.blue, 40), style=plot.style_linebr)
 plot(orReady and tNum <= orbEndTime ? orL : na, "OR Low",  color=color.new(color.blue, 40), style=plot.style_linebr)
 plot(pdhV, "PDH", color=color.new(color.gray, 60), style=plot.style_linebr)
@@ -478,7 +487,8 @@ if showDash and barstate.islast
     table.cell(dash, 1, 5, (partialWin ? "SCALED  " : "50%@" + str.tostring(scaleR, "#.#") + "R  ") + (beArmed ? "BE on" : "BE wait"),
          text_color=beArmed ? color.lime : color.silver, text_size=size.tiny)
     table.cell(dash, 0, 6, "Session", text_color=color.silver, text_size=size.tiny)
-    string sessTxt = eod ? "FLAT WINDOW" : inMorning ? "PRIME AM" : inAfternoon ? "PM (research)" : inLunch ? "LUNCH" : "NO ENTRY"
+    string sessTxt = (eod ? "FLAT WINDOW" : inMorning ? "PRIME AM" : inAfternoon ? "PM (research)" : inLunch ? "LUNCH" : "NO ENTRY") +
+         (not mtfOn ? "" : ((mtfLongOK and not mtfShortOK) ? " · 45↑" : (mtfShortOK and not mtfLongOK) ? " · 45↓" : " · 45 flat"))
     table.cell(dash, 1, 6, sessTxt, text_color=eod ? color.red : inSession ? color.lime : color.gray, text_size=size.tiny)
     table.cell(dash, 0, 7, "Runner", text_color=color.silver, text_size=size.tiny)
     table.cell(dash, 1, 7, sqzExit == "Structure Hold" ? structRule : "Fixed " + str.tostring(rrRatio, "#.#") + "R",
